@@ -1,0 +1,352 @@
+"""
+Shinzo Brand Scraper
+Scrapes all products from eu.shinzobrand.com, generates embeddings, uploads to Supabase.
+Handles geo-localized prices by detecting currency from API response.
+"""
+
+import json
+import io
+import os
+import re
+import time
+from datetime import datetime, timezone
+
+import requests
+import torch
+from PIL import Image
+from supabase import create_client, Client
+from transformers import AutoProcessor, AutoModel
+
+BASE_URL = "https://eu.shinzobrand.com"
+SOURCE = "scraper-schinzo"
+BRAND = "Schinzo Brand"
+
+COLLECTIONS = [
+    ("head-wear", "Headwear"),
+    ("jumpers-jackets", "Jumpers, Jackets"),
+    ("t-shirts", "Shirting"),
+    ("knitwear", "Knitwear"),
+    ("jeans-bottoms", "Jeans, Bottoms"),
+    ("accessories", "Accessories"),
+]
+
+API_PARAMS = "?limit=250&currency=CZK"
+
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL",
+    "https://yqawmzggcgpeyaaynrjk.supabase.co",
+)
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxYXdtemdnY2dwZXlhYXlucmprIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTAxMDkyNiwiZXhwIjoyMDcwNTg2OTI2fQ.XtLpxausFriraFJeX27ZzsdQsFv3uQKXBBggoz6P4D4",
+)
+
+RATES_FROM_EUR = {
+    "EUR": 1.0, "USD": 1.1595, "CZK": 24.289, "PLN": 4.242,
+    "GBP": 0.86418, "SEK": 10.8695, "NOK": 10.7295, "DKK": 7.4731,
+    "HUF": 359.08, "RON": 5.249, "CHF": 0.9119, "AUD": 1.6283,
+    "CAD": 1.6002, "AED": 4.258, "JPY": 184.53, "CNY": 7.8791,
+    "INR": 110.9585, "MXN": 20.1045, "TRY": 53.0067, "BRL": 5.8165,
+    "HKD": 9.0865, "SGD": 1.4846, "NZD": 1.9817, "KRW": 1759.6,
+    "THB": 37.875, "ILS": 3.3569, "ISK": 143.6, "PHP": 71.45,
+    "MYR": 4.6009, "IDR": 20516.54, "ZAR": 19.1045,
+}
+
+CURRENCY_PRIORITY = ["EUR", "USD", "CZK", "PLN", "GBP", "SEK", "NOK", "DKK", "HUF", "RON", "CHF", "AUD", "CAD"]
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+def load_model():
+    print("Loading SigLIP model...")
+    model_name = "google/siglip-base-patch16-384"
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name).to(device).eval()
+    return processor, model
+
+
+def convert_to_all_currencies(price_czk: float) -> str:
+    eur = price_czk / RATES_FROM_EUR["CZK"]
+    parts = []
+    for currency in CURRENCY_PRIORITY:
+        rate = RATES_FROM_EUR.get(currency)
+        if rate is None:
+            continue
+        converted = round(eur * rate, 2)
+        parts.append(f"{converted}{currency}")
+    return ", ".join(parts)
+
+
+def clean_html(html_text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", html_text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("&amp;", "&").replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">")
+    return text
+
+
+def fetch_all_products_from_collections() -> dict:
+    handle_data: dict[str, dict] = {}
+    for col_handle, cat_name in COLLECTIONS:
+        url = f"{BASE_URL}/collections/{col_handle}/products.json{API_PARAMS}"
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"  ERROR fetching {col_handle}: {e}")
+            continue
+
+        products = data.get("products", [])
+        print(f"  {col_handle}: {len(products)} products")
+        for prod in products:
+            h = prod["handle"]
+            if h not in handle_data:
+                handle_data[h] = {
+                    "categories": set(),
+                    "collection_title": prod.get("title", ""),
+                    "collection_vendor": prod.get("vendor", "Shinzo"),
+                    "collection_product_type": prod.get("product_type", ""),
+                    "collection_tags": prod.get("tags", ""),
+                    "collection_variants": [],
+                    "collection_images": prod.get("images", []),
+                }
+            handle_data[h]["categories"].add(cat_name)
+            for v in prod.get("variants", []):
+                handle_data[h]["collection_variants"].append(v)
+    return handle_data
+
+
+def fetch_product_json(handle: str) -> dict | None:
+    url = f"{BASE_URL}/products/{handle}.json?currency=CZK"
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()["product"]
+    except Exception as e:
+        print(f"    ERROR fetching product {handle}: {e}")
+        return None
+
+
+def get_image_embedding(processor, model, image_url: str) -> list[float] | None:
+    try:
+        resp = requests.get(image_url, timeout=30)
+        resp.raise_for_status()
+        image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        inputs = processor(images=image, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = model.get_image_features(**inputs)
+        return outputs.pooler_output[0].cpu().tolist()
+    except Exception as e:
+        print(f"    ERROR embedding image {image_url}: {e}")
+        return None
+
+
+def get_text_embedding(processor, model, text: str) -> list[float] | None:
+    try:
+        tokens = processor.tokenizer(text, truncation=True, max_length=60, return_tensors="pt")
+        inputs = {"input_ids": tokens["input_ids"].to(device)}
+        with torch.no_grad():
+            outputs = model.get_text_features(**inputs)
+        return outputs.pooler_output[0].cpu().tolist()
+    except Exception as e:
+        print(f"    ERROR embedding text: {e}")
+        return None
+
+
+def build_product_record(handle: str, col_data: dict, full_product: dict | None,
+                         processor, model) -> dict | None:
+    title = col_data["collection_title"]
+    product_type = col_data["collection_product_type"]
+    tags_raw = col_data["collection_tags"]
+    if isinstance(tags_raw, str):
+        tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+    else:
+        tags = list(tags_raw) if tags_raw else []
+
+    vendor = col_data.get("collection_vendor", "Shinzo")
+
+    body_html = (full_product or {}).get("body_html", "")
+    description = clean_html(body_html)
+
+    variants = col_data["collection_variants"]
+    if not variants:
+        return None
+
+    prices_czk = []
+    sale_prices_czk = []
+    sale_detected = False
+    for v in variants:
+        price_str = v.get("price", "0")
+        try:
+            price_f = float(price_str)
+        except (ValueError, TypeError):
+            continue
+        prices_czk.append(price_f)
+
+        cap = v.get("compare_at_price")
+        if cap is not None and cap != "":
+            try:
+                cap_f = float(cap)
+                if cap_f > 0 and abs(cap_f - price_f) > 0.01:
+                    sale_detected = True
+                    sale_prices_czk.append(price_f)
+            except (ValueError, TypeError):
+                pass
+
+    if not prices_czk:
+        return None
+
+    min_price_czk = min(prices_czk)
+
+    price_str = convert_to_all_currencies(min_price_czk)
+
+    sale_value = None
+    if sale_detected and sale_prices_czk:
+        sale_value = f"{min(sale_prices_czk):.2f}CZK"
+
+    sizes_raw = [v.get("title", "").strip() for v in variants if v.get("title", "").strip()]
+    seen = set()
+    sizes = []
+    for s in sizes_raw:
+        if s not in seen:
+            seen.add(s)
+            sizes.append(s)
+
+    images = (full_product or {}).get("images") or col_data.get("collection_images") or []
+    if not images:
+        return None
+
+    primary_image_url = images[0]["src"]
+    additional_image_urls = [img["src"] for img in images[1:]]
+    additional_images_str = " , ".join(additional_image_urls) if additional_image_urls else None
+
+    product_url = f"{BASE_URL}/products/{handle}"
+
+    categories = list(col_data["categories"])
+    if product_type and product_type not in categories:
+        categories.append(product_type)
+    category_str = ", ".join(categories) if categories else None
+
+    gender = None
+
+    size_str = ", ".join(sizes) if sizes else None
+
+    available_count = sum(1 for v in variants if v.get("available"))
+
+    metadata_parts = {
+        "title": title,
+        "description": description,
+        "sizes": sizes,
+        "price_czk": min_price_czk,
+        "category": category_str,
+        "tags": tags,
+        "vendor": vendor,
+        "product_type": product_type,
+        "sku": variants[0].get("sku", ""),
+        "available_variants": available_count,
+        "total_variants": len(variants),
+    }
+    if sale_detected:
+        metadata_parts["on_sale"] = True
+        metadata_parts["sale_price_czk"] = sale_value
+
+    metadata_json = json.dumps(metadata_parts, ensure_ascii=False)
+
+    info_text = (
+        f"Title: {title}. Description: {description}. "
+        f"Category: {category_str}. Price: {price_str}. "
+        f"Sizes: {size_str}. Tags: {', '.join(tags)}. "
+        f"Gender: {gender or 'unisex'}. Brand: {BRAND}."
+    )
+
+    print(f"    Generating image embedding...")
+    image_emb = get_image_embedding(processor, model, primary_image_url)
+    if image_emb is None:
+        return None
+
+    print(f"    Generating text embedding...")
+    text_emb = get_text_embedding(processor, model, info_text)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    record = {
+        "id": handle,
+        "source": SOURCE,
+        "product_url": product_url,
+        "image_url": primary_image_url,
+        "brand": BRAND,
+        "title": title,
+        "description": description,
+        "category": category_str,
+        "gender": gender,
+        "created_at": now,
+        "metadata": metadata_json,
+        "size": size_str,
+        "second_hand": False,
+        "image_embedding": image_emb,
+        "country": None,
+        "tags": tags if tags else None,
+        "price": price_str,
+        "sale": sale_value,
+        "additional_images": additional_images_str,
+        "info_embedding": text_emb,
+    }
+
+    return record
+
+
+def upload_to_supabase(records: list[dict]):
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    inserted = 0
+    errors = 0
+    for rec in records:
+        try:
+            supabase.table("products").upsert(rec, on_conflict="id").execute()
+            inserted += 1
+        except Exception as e:
+            print(f"    ERROR uploading {rec['id']}: {e}")
+            errors += 1
+        time.sleep(0.1)
+    return inserted, errors
+
+
+def main():
+    processor, model = load_model()
+
+    print("\nStage 1: Collecting all product handles from collections...")
+    handle_data = fetch_all_products_from_collections()
+    print(f"Total unique products found: {len(handle_data)}")
+
+    print("\nStage 2: Fetching product details and generating embeddings...")
+    successful_records = []
+    failed = 0
+    for i, handle in enumerate(sorted(handle_data.keys()), 1):
+        col_data = handle_data[handle]
+        print(f"  [{i}/{len(handle_data)}] {handle}...")
+
+        full_product = fetch_product_json(handle)
+
+        record = build_product_record(handle, col_data, full_product, processor, model)
+        if record is None:
+            print(f"    FAILED to build record for {handle}")
+            failed += 1
+            continue
+
+        successful_records.append(record)
+        title_short = record["title"][:60]
+        print(f"    OK - {title_short}")
+
+    print(f"\nStage 4: Uploading {len(successful_records)} records to Supabase...")
+    inserted, errors = upload_to_supabase(successful_records)
+
+    print(f"\n=== DONE ===")
+    print(f"  Total products found: {len(handle_data)}")
+    print(f"  Successfully processed: {len(successful_records)}")
+    print(f"  Uploaded: {inserted}")
+    print(f"  Errors: {errors}")
+    print(f"  Failed to build: {failed}")
+
+
+if __name__ == "__main__":
+    main()

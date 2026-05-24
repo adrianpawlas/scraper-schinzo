@@ -1,0 +1,6 @@
+requests>=2.31
+pillow>=11.0
+torch>=2.0
+torchvision>=0.15
+transformers>=4.45
+supabase>=2.0
