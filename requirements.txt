@@ -4,4 +4,5 @@ torch>=2.0
 torchvision>=0.15
 transformers>=4.45
 sentencepiece>=0.2
+protobuf>=5.28
 supabase>=2.0
